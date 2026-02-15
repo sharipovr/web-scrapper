@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"flag"
 	"fmt"
 	"io"
 	"log"
@@ -13,6 +14,8 @@ import (
 
 	"golang.org/x/net/html"
 )
+
+var debugMode bool
 
 // ScrapedData represents the structured data extracted from a web page
 type ScrapedData struct {
@@ -45,6 +48,10 @@ type ErrorResponse struct {
 }
 
 func main() {
+	// Parse command line flags
+	flag.BoolVar(&debugMode, "debug", false, "Enable debug logging")
+	flag.Parse()
+
 	mux := http.NewServeMux()
 
 	// Scraper endpoint
@@ -54,6 +61,9 @@ func main() {
 
 	addr := ":8080"
 	log.Printf("Web Scraper API starting on %s", addr)
+	if debugMode {
+		log.Printf("Debug mode enabled")
+	}
 	log.Printf("Example usage: curl 'http://localhost:8080/scrape?url=http://example.com'")
 
 	if err := http.ListenAndServe(addr, mux); err != nil {
@@ -115,8 +125,14 @@ func scrapeWebPage(targetURL string) (*ScrapedData, error) {
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Set user agent to avoid being blocked
-	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; WebScraperBot/1.0)")
+	// Set realistic browser headers to reduce detection
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	// Note: Don't set Accept-Encoding - Go's http.Client handles compression automatically
+	req.Header.Set("DNT", "1")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
 
 	client := &http.Client{
 		Timeout: 15 * time.Second,
@@ -130,7 +146,31 @@ func scrapeWebPage(targetURL string) (*ScrapedData, error) {
 
 	// Check response status
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		// Detect anti-bot services
+		antiBotInfo := detectAntiBotService(resp)
+
+		// Log diagnostic information
+		log.Printf("❌ Request blocked - Status: %d", resp.StatusCode)
+		if debugMode {
+			log.Printf("📋 Response Headers: %+v", resp.Header)
+			if antiBotInfo != "" {
+				log.Printf("🛡️  Anti-bot service detected: %s", antiBotInfo)
+			}
+
+			// Read error response body for more context
+			body, _ := io.ReadAll(resp.Body)
+			if len(body) > 0 && len(body) < 1000 {
+				log.Printf("📄 Response body: %s", string(body))
+			}
+		} else if antiBotInfo != "" {
+			log.Printf("🛡️  Anti-bot service detected: %s", antiBotInfo)
+		}
+
+		errorMsg := fmt.Sprintf("unexpected status code: %d", resp.StatusCode)
+		if antiBotInfo != "" {
+			errorMsg += fmt.Sprintf(" (detected: %s)", antiBotInfo)
+		}
+		return nil, fmt.Errorf(errorMsg)
 	}
 
 	// Check content type
@@ -143,6 +183,20 @@ func scrapeWebPage(targetURL string) (*ScrapedData, error) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+
+	// Log response info for debugging
+	if debugMode {
+		log.Printf("✅ Successfully fetched %s", targetURL)
+		log.Printf("📊 Response size: %d bytes", len(body))
+		log.Printf("📄 Content-Type: %s", contentType)
+
+		// Show first 500 chars of HTML for debugging
+		preview := string(body)
+		if len(preview) > 500 {
+			preview = preview[:500] + "..."
+		}
+		log.Printf("🔍 HTML Preview:\n%s", preview)
 	}
 
 	// Parse HTML
@@ -162,6 +216,12 @@ func scrapeWebPage(targetURL string) (*ScrapedData, error) {
 
 	// Traverse the HTML tree and extract information
 	extractData(doc, data, targetURL)
+
+	// Log extraction results
+	if debugMode {
+		log.Printf("📈 Extraction results: Title=%q, Links=%d, Images=%d, Headings=%d, MetaTags=%d",
+			data.Title, len(data.Links), len(data.Images), len(data.Headings), len(data.MetaTags))
+	}
 
 	return data, nil
 }
@@ -302,6 +362,32 @@ func resolveURL(baseURL, href string) string {
 	}
 
 	return base.ResolveReference(ref).String()
+}
+
+func detectAntiBotService(resp *http.Response) string {
+	// Check for common anti-bot and WAF services
+	if resp.Header.Get("Server") == "cloudflare" || resp.Header.Get("CF-Ray") != "" {
+		return "Cloudflare"
+	}
+	if resp.Header.Get("X-Akamai-Transformed") != "" || resp.Header.Get("X-Akamai-Session-Info") != "" {
+		return "Akamai"
+	}
+	if resp.Header.Get("X-Amzn-RequestId") != "" || resp.Header.Get("X-Amzn-Trace-Id") != "" {
+		return "AWS WAF"
+	}
+	if resp.Header.Get("X-Iinfo") != "" || resp.Header.Get("X-CDN") == "Incapsula" {
+		return "Imperva/Incapsula"
+	}
+	if resp.Header.Get("X-DataDome") != "" {
+		return "DataDome"
+	}
+	if resp.Header.Get("X-Sucuri-ID") != "" || resp.Header.Get("X-Sucuri-Cache") != "" {
+		return "Sucuri"
+	}
+	if strings.Contains(resp.Header.Get("Server"), "PerimeterX") {
+		return "PerimeterX"
+	}
+	return ""
 }
 
 func sendError(w http.ResponseWriter, statusCode int, errorType, message string) {
